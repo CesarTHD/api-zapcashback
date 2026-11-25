@@ -11,6 +11,8 @@ export async function readErp<T>(sql: string, params: Parameter[] = [], exact = 
     user: process.env.SAT_DB_USER || "",
     password: process.env.SAT_DB_PASSWORD || "",
     numericMode: exact ? NUMERIC_MODE_STRING : undefined,
+    // O banco do SAT usa charset NONE com textos gravados em Windows-1252; sem isso, acentos chegam como "�".
+    encoding: (process.env.SAT_DB_ENCODING || "WIN1252") as Options["encoding"],
   };
   if (!options.database || !options.user || !options.password) throw new Error("ERP indisponível");
   const db = await new Promise<Database>((resolve, reject) => {
