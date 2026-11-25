@@ -1,132 +1,108 @@
-import { access, SatError } from "./access";
-import { branchFilter, readErp, saleAmount, validSale } from "./erp";
-import { satDb, transaction } from "./store";
+import { SatError } from "./access";
+import { branchFilter, clientPhone, readErp } from "./erp";
 
-type Scope = Pick<ReturnType<typeof access>, "company" | "actor" | "branches">;
-type Sale = { CODCLI: number; LOJA: number; CENTS: string | number | null; LEGACY: number; RETURNED: number };
+type Scope = { branches: number[] | null };
 
-export function calculateCredit(cents: bigint, basisPoints: number, maximum: bigint) {
-  const credit = (cents * BigInt(basisPoints) + 5000n) / 10000n;
-  return credit > maximum ? maximum : credit;
-}
+/* Cashback nativo do ERP SAT (tabela CLIENTES_CASHBACK).
+   STATUS (confirmado com a SAT): 0 = não resgatado ou parcialmente resgatado, 1 = resgatado, 2 = cancelado. Não existe 3. PRAZO = data de validade do crédito.
+   A filial vem da venda de origem (OE.LOJA). Valores DOUBLE são arredondados para centavos linha a linha. */
+const cbCredit = "COALESCE(cb.VALOR_CASHBACK,cb.VALOR,0)";
+const cbRedeemed = "COALESCE(cb.VALOR_RESGATADO,0)";
+const toCents = (expr: string) => `CAST(ROUND((${expr})*100,0) AS BIGINT)`;
+export const cbExpired = "(cb.PRAZO IS NOT NULL AND CAST(cb.PRAZO AS DATE)<CURRENT_DATE)";
+export const cbOpen = `cb.STATUS=0 AND ${cbCredit}-${cbRedeemed}>0`;
+export const cbFrom = "FROM CLIENTES_CASHBACK cb LEFT JOIN OE o ON o.ID_OE=cb.ID_OE AND o.DATA=cb.DATA_OE";
+/* Lista de movimentações: inclui nome e telefone do cliente (CLI). */
+export const cbListFrom = `${cbFrom} LEFT JOIN CLI c ON c.CODCLI=cb.CODCLI`;
+export const cbListFields = () => `${cbEntryFields}, TRIM(c.CLI) NOME, ${clientPhone} TELEFONE`;
+export const cbStatusFilters: Record<string, string> = {
+  disponível: `cb.STATUS=0 AND NOT ${cbExpired}`,
+  expirado: `cb.STATUS=0 AND ${cbExpired}`,
+  resgatado: "cb.STATUS=1",
+  cancelado: "cb.STATUS=2",
+  indefinido: "(cb.STATUS IS NULL OR cb.STATUS NOT IN (0,1,2))",
+};
+export const cbSummary = `COALESCE(SUM(${toCents(cbCredit)}),0) GENERATED,
+  COALESCE(SUM(CASE WHEN ${cbOpen} AND NOT ${cbExpired} THEN ${toCents(`${cbCredit}-${cbRedeemed}`)} END),0) AVAILABLE,
+  COALESCE(SUM(CASE WHEN ${cbOpen} AND ${cbExpired} THEN ${toCents(`${cbCredit}-${cbRedeemed}`)} END),0) EXPIRED,
+  COALESCE(SUM(CASE WHEN cb.STATUS IN (0,1) THEN ${toCents(cbRedeemed)} END),0) REDEEMED`;
+export const cbEntryFields = `cb.COD, o.LOJA, cb.CODCLI, CAST(CAST(cb.DATA_OE AS DATE) AS VARCHAR(10)) SALE_DATE, cb.ID_OE,
+  ${toCents("COALESCE(cb.VALOR_VENDA,0)")} SALE_CENTS, ${toCents(cbCredit)} AMOUNT_CENTS, ${toCents(cbRedeemed)} REDEEMED_CENTS,
+  ${toCents(`${cbCredit}-${cbRedeemed}`)} REMAINING_CENTS, CAST(CAST(cb.PRAZO AS DATE) AS VARCHAR(10)) EXPIRES_AT,
+  cb.STATUS, CASE WHEN ${cbExpired} THEN 1 ELSE 0 END EXPIRED`;
 
-export async function grant(scope: Scope, date: string, saleId: number, preview: boolean, source: "manual" | "automatic",
-  expected?: { saleCents: string; creditCents: string }) {
-  const [sale] = await readErp<Sale>(`SELECT o.CODCLI, o.LOJA, CAST(${saleAmount} * 100 AS DECIMAL(17,0)) CENTS,
-    CASE WHEN COALESCE(o.VALOR_CASHBACK_GERADO,0)>0 OR COALESCE(o.VALOR_CASHBACK_NUMMUS,0)>0
-      OR COALESCE(o.VALOR_CASHBACK,0)>0 OR EXISTS (SELECT 1 FROM CLIENTES_CASHBACK cb
-      WHERE cb.ID_OE=o.ID_OE AND cb.DATA_OE=o.DATA) THEN 1 ELSE 0 END LEGACY,
-    CASE WHEN EXISTS (SELECT 1 FROM IOE i WHERE i.DATA=o.DATA AND i.ID_OE=o.ID_OE
-      AND (COALESCE(i.QUANT_DEVOLVIDO,0)>0 OR TRIM(i.DEVOLVIDO)='S'
-      OR NULLIF(TRIM(i.CANC),'') IS NOT NULL)) THEN 1 ELSE 0 END RETURNED
-    FROM OE o JOIN CLI c ON c.CODCLI=o.CODCLI
-    WHERE o.DATA=CAST(? AS DATE) AND o.ID_OE=? AND ${validSale}${branchFilter(scope.branches)}`,
-    [date, saleId, ...(scope.branches || [])], true);
-  if (!sale || !Number.isInteger(sale.LOJA) || sale.LOJA <= 0) throw new SatError(404, "Venda elegível não encontrada");
-  if (sale.LEGACY || sale.RETURNED) throw new SatError(409, "Venda com cashback legado, devolução ou item cancelado");
-  if (sale.CENTS === null || !/^\d+$/.test(String(sale.CENTS))) throw new SatError(409, "Valor da venda inválido");
-  const cents = BigInt(sale.CENTS);
-  if (cents <= 0n) throw new SatError(409, "Valor da venda inválido");
-  return transaction(async db => {
-    const { rows: [rule] } = await db.query(
-      `SELECT *, to_char(starts_on,'YYYY-MM-DD') start_day
-       FROM sat_rules WHERE company=$1 AND branch IN (0,$2)
-       ORDER BY branch DESC LIMIT 1 FOR SHARE`, [scope.company, sale.LOJA]);
-    if (!rule?.enabled || date < rule.start_day || cents < BigInt(rule.minimum_cents)) {
-      throw new SatError(409, "Venda fora da regra vigente de cashback");
-    }
-    const credit = calculateCredit(cents, rule.basis_points, BigInt(rule.maximum_cents));
-    if (credit <= 0n) throw new SatError(409, "Venda sem valor de cashback elegível");
-    if (expected && (expected.saleCents !== cents.toString() || expected.creditCents !== credit.toString())) {
-      throw new SatError(409,"A venda ou a regra mudou. Simule novamente antes de confirmar.");
-    }
-    const params = [scope.company, sale.LOJA, sale.CODCLI, date, saleId, cents.toString(), credit.toString(),
-      source, scope.actor, rule.delay_days, rule.validity_days];
-    const { rows: [existing] } = await db.query(
-      "SELECT id,amount_cents FROM sat_ledger WHERE company=$1 AND sale_date=$2 AND sale_id=$3 AND kind='credit'",
-      [scope.company, date, saleId]);
-    if (existing) throw new SatError(409, "Cashback já registrado para a venda");
-    const quote = { saleCents: cents.toString(), creditCents: credit.toString(), customer: sale.CODCLI, branch: sale.LOJA };
-    if (preview) return quote;
-    const { rows: [created] } = await db.query<{ id: string; amount_cents: string }>(`INSERT INTO sat_ledger
-      (company,branch,customer,sale_date,sale_id,sale_cents,amount_cents,kind,source,actor,available_at,expires_at)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,'credit',$8,$9,
-      GREATEST(now(),(($4::date+$10::integer)::timestamp AT TIME ZONE 'America/Sao_Paulo')),
-      GREATEST(now(),(($4::date+$10::integer)::timestamp AT TIME ZONE 'America/Sao_Paulo'))+$11::integer*interval '1 day')
-      ON CONFLICT (company,sale_date,sale_id,kind) DO NOTHING RETURNING id,amount_cents`, params);
-    if (!created) throw new SatError(409, "Cashback já registrado para a venda");
-    return { ...quote, ...created };
-  });
-}
+type Summary = { GENERATED: string; AVAILABLE: string; EXPIRED: string; REDEEMED: string };
+export const summaryRow = (row?: Partial<Summary>) => ({ generated: String(row?.GENERATED ?? 0),
+  available: String(row?.AVAILABLE ?? 0), pending: "0", expired: String(row?.EXPIRED ?? 0), redeemed: String(row?.REDEEMED ?? 0) });
+
+type Entry = { COD: number; LOJA: number | null; CODCLI: number; SALE_DATE: string; ID_OE: number; SALE_CENTS: string;
+  AMOUNT_CENTS: string; REDEEMED_CENTS: string; REMAINING_CENTS: string; EXPIRES_AT: string | null; STATUS: number | null; EXPIRED: number;
+  NOME?: string | null; TELEFONE?: string | null };
+export const entryRow = (row: Entry) => ({ id: row.COD, branch: row.LOJA, customer: row.CODCLI, sale_date: row.SALE_DATE,
+  sale_id: row.ID_OE, sale_cents: String(row.SALE_CENTS), amount_cents: String(row.AMOUNT_CENTS),
+  redeemed_cents: String(row.REDEEMED_CENTS), remaining_cents: String(row.REMAINING_CENTS), expires_at: row.EXPIRES_AT,
+  kind: "erp", source: "pdv", name: row.NOME ?? null, phone: row.TELEFONE ?? null,
+  status: row.STATUS === 0 ? (row.EXPIRED ? "expirado" : "disponível") : row.STATUS === 1 ? "resgatado"
+    : row.STATUS === 2 ? "cancelado" : "indefinido" });
 
 export async function balances(scope: Scope, customers: number[]) {
-  if (!customers.length) return new Map();
-  const { rows } = await satDb().query(`SELECT customer,
-    SUM(amount_cents) generated,
-    COALESCE(SUM(amount_cents) FILTER (WHERE NOT reversed AND available_at<=now() AND expires_at>now()),0) available,
-    COALESCE(SUM(amount_cents) FILTER (WHERE NOT reversed AND available_at>now()),0) pending,
-    COALESCE(SUM(amount_cents) FILTER (WHERE NOT reversed AND expires_at<=now()),0) expired
-    FROM (SELECT l.*,EXISTS (SELECT 1 FROM sat_ledger r WHERE r.company=l.company AND r.sale_date=l.sale_date
-      AND r.sale_id=l.sale_id AND r.kind='reversal') AS reversed
-      FROM sat_ledger l WHERE company=$1 AND customer=ANY($2::integer[])
-      AND ($3::integer[] IS NULL OR branch=ANY($3)) AND kind='credit') credits GROUP BY customer`,
-    [scope.company, customers, scope.branches]);
-  return new Map(rows.map(row => [row.customer, row]));
+  if (!customers.length) return new Map<number, ReturnType<typeof summaryRow>>();
+  const rows = await readErp<Summary & { CODCLI: number }>(`SELECT cb.CODCLI, ${cbSummary} ${cbFrom}
+    WHERE cb.CODCLI IN (${customers.map(() => "?").join(",")})${branchFilter(scope.branches)} GROUP BY cb.CODCLI`,
+    [...customers, ...(scope.branches || [])], true);
+  return new Map(rows.map(row => [row.CODCLI, summaryRow(row)]));
 }
 
-export async function processSales(scope: Scope, date: string, after: number) {
-  const batch = await readErp<{ ID_OE: number }>(`SELECT FIRST 51 o.ID_OE FROM OE o
-    WHERE o.DATA=CAST(? AS DATE) AND o.ID_OE>? AND ${validSale}${branchFilter(scope.branches)} ORDER BY o.ID_OE`,
-    [date,after,...(scope.branches || [])]);
-  let created = 0;
-  let skipped = 0;
-  for (const sale of batch.slice(0,50)) {
-    try {
-      await grant(scope,date,sale.ID_OE,false,"automatic");
-      created++;
-    } catch (error) {
-      if (!(error instanceof SatError) || ![404,409].includes(error.status)) throw error;
-      skipped++;
-    }
-  }
-  return { created, skipped, next: batch.length>50 ? batch[49]?.ID_OE : null };
+export async function expiringCredits(scope: Scope, customer: number) {
+  const rows = await readErp<Entry>(`SELECT FIRST 10 ${cbEntryFields} ${cbFrom}
+    WHERE cb.CODCLI=? AND ${cbOpen} AND NOT ${cbExpired}${branchFilter(scope.branches)}
+    ORDER BY cb.PRAZO NULLS LAST, cb.COD`, [customer, ...(scope.branches || [])], true);
+  return rows.map(row => ({ ...entryRow(row), amount_cents: String(row.REMAINING_CENTS) }));
 }
 
-export function startSatGeneration() {
-  const company = process.env.SAT_COMPANY_ID;
-  const actor = process.env.SAT_AUTO_GRANT_ACTOR;
-  if (!company || !actor) return;
-  if (!/^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(actor)) {
-    console.error("Identificador do ator de geração SAT inválido");
-    return;
-  }
-  const days = Number(process.env.SAT_AUTO_GRANT_LOOKBACK_DAYS || 3);
-  if (!Number.isSafeInteger(days) || days<1 || days>30) {
-    console.error("Janela de geração SAT inválida");
-    return;
-  }
-  const formatter = new Intl.DateTimeFormat("sv-SE",{ timeZone:"America/Sao_Paulo" });
-  let running = false;
-  let cursor = 0;
-  let offset = 0;
-  let cycleDay = "";
-  setInterval(async () => {
-    if (running) return;
-    running = true;
-    try {
-      const now = Date.now();
-      const today = formatter.format(now);
-      if (cycleDay !== today) {
-        cycleDay = today;
-        cursor = 0;
-        offset = 0;
-      }
-      const date = formatter.format(now-offset*86400000);
-      const result = await processSales({ company, actor, branches:null },date,cursor);
-      cursor = result.next ?? 0;
-      if (!result.next) offset = (offset+1)%days;
-    } catch (error) {
-      console.error("Falha na geração automática SAT",(error as { code?: string })?.code ?? "sem código");
-    } finally { running = false; }
-  },60000).unref();
+/* Filtros de público por situação do cashback no ERP. Retorna os clientes de `customers` que atendem ao filtro. */
+export const walletFilters = ["available","expiring","used","never_used"] as const;
+export async function walletCustomers(scope: Scope, customers: number[], wallet: typeof walletFilters[number], expiryDays: number | null) {
+  if (!customers.length) return new Set<number>();
+  const having: Record<typeof walletFilters[number], string> = {
+    available: `SUM(CASE WHEN ${cbOpen} AND NOT ${cbExpired} THEN 1 ELSE 0 END)>0`,
+    expiring: `SUM(CASE WHEN ${cbOpen} AND NOT ${cbExpired} AND CAST(cb.PRAZO AS DATE)<=DATEADD(? DAY TO CURRENT_DATE) THEN 1 ELSE 0 END)>0`,
+    used: `SUM(CASE WHEN ${cbRedeemed}>0 THEN 1 ELSE 0 END)>0`,
+    never_used: `SUM(CASE WHEN ${cbRedeemed}>0 THEN 1 ELSE 0 END)=0`,
+  };
+  if (wallet === "expiring" && expiryDays === null) throw new SatError(400,"Informe os dias até o vencimento");
+  const rows = await readErp<{ CODCLI: number }>(`SELECT cb.CODCLI ${cbFrom}
+    WHERE cb.CODCLI IN (${customers.map(() => "?").join(",")})${branchFilter(scope.branches)}
+    GROUP BY cb.CODCLI HAVING ${having[wallet]}`,
+    [...customers, ...(scope.branches || []), ...(wallet === "expiring" ? [expiryDays as number] : [])]);
+  return new Set(rows.map(row => row.CODCLI));
+}
+
+/* Eventos de automação sobre os créditos do ERP. `since` é o dia (São Paulo) em que a automação foi ativada. */
+export type CreditEvent = "granted" | "released" | "expiring" | "expired";
+export async function creditEventCandidates(customers: number[], event: CreditEvent, since: string, days: number) {
+  if (!customers.length) return [];
+  const conditions: Record<CreditEvent, [string, (string | number)[]]> = {
+    granted: [`${cbOpen} AND NOT ${cbExpired} AND cb.DATA_OE>=CAST(? AS DATE)`, [since]],
+    released: [`${cbOpen} AND NOT ${cbExpired} AND cb.DATA_OE>=CAST(? AS DATE)`, [since]],
+    expiring: [`${cbOpen} AND NOT ${cbExpired} AND CAST(cb.PRAZO AS DATE)<=DATEADD(? DAY TO CURRENT_DATE)`, [days]],
+    expired: [`${cbOpen} AND ${cbExpired} AND CAST(cb.PRAZO AS DATE)>=CAST(? AS DATE)`, [since]],
+  };
+  const [condition, params] = conditions[event];
+  const rows = await readErp<{ COD: number; CODCLI: number }>(`SELECT cb.COD, cb.CODCLI FROM CLIENTES_CASHBACK cb
+    WHERE cb.CODCLI IN (${customers.map(() => "?").join(",")}) AND ${condition} ORDER BY cb.COD`, [...customers, ...params]);
+  return rows.map(row => ({ customer: row.CODCLI, event_key: `cb:${row.COD}` }));
+}
+
+/* Configuração de cashback por loja, mantida no próprio ERP SAT (tabela LOJAS). Somente leitura. */
+export async function cashbackRules(scope: Scope) {
+  const rows = await readErp<Record<string, unknown>>(`SELECT l.LOJA, TRIM(l.LOJAD) NOME, l.CASHBACK_ATIVO, l.ATIVARCASHBACK,
+    ${toCents("COALESCE(l.CASHBACK_VALOR_MINIMO,0)")} MINIMO_CENTS, l.CASHBACK_PERCENTUAL, l.CASHBACK_PERCENTUAL_VENDA,
+    l.CASHBACK_PRAZO FROM LOJAS l WHERE 1=1${branchFilter(scope.branches,"l.LOJA")} ORDER BY l.LOJA`,
+    scope.branches || [], true);
+  return rows.map(row => ({ branch: row.LOJA, name: row.NOME ?? null,
+    enabled: String(row.CASHBACK_ATIVO ?? "").trim() === "S" || String(row.ATIVARCASHBACK ?? "").trim() === "S",
+    percent: row.CASHBACK_PERCENTUAL == null ? null : Number(row.CASHBACK_PERCENTUAL),
+    sale_percent: row.CASHBACK_PERCENTUAL_VENDA == null ? null : Number(row.CASHBACK_PERCENTUAL_VENDA),
+    minimum_cents: String(row.MINIMO_CENTS ?? 0), validity_days: row.CASHBACK_PRAZO == null ? null : Number(row.CASHBACK_PRAZO) }));
 }

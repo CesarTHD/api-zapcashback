@@ -1,6 +1,7 @@
 import { access, day, integer, SatError } from "./access";
 import { branchFilter, clientPhone, readErp, validSale, saleAmount } from "./erp";
 import { satDb } from "./store";
+import { walletCustomers, walletFilters } from "./cashback";
 
 type Scope = ReturnType<typeof access>;
 type Candidate = { CODCLI: number; DAYS: number | null; PURCHASES: number; SPENT: string; CITY: string | null; PHONE: string };
@@ -16,9 +17,8 @@ export async function selectAudience(scope: Scope, filters: Filters) {
   const { city, minDays, maxDays, minPurchases, minSpentCents, minTicketCents, lastPurchaseFrom, lastPurchaseTo,
     wallet, expiresWithinDays, customer } = filters;
   const customerId = customer == null ? null : integer(customer,0,2147483647);
-  const allWallets = ["available","expiring","used","never_used"];
-  if (wallet !== undefined && !allWallets.includes(String(wallet))) throw new SatError(400,"Filtro de cashback inválido");
-  if (wallet === "used" || wallet === "never_used") throw new SatError(409,"Filtro indisponível até existir confirmação de resgates");
+  const walletFilter = wallet === undefined ? null : walletFilters.find(name => name === wallet);
+  if (walletFilter === undefined) throw new SatError(400,"Filtro de cashback inválido");
   if (city !== undefined && (typeof city !== "string" || city.length > 100)) throw new SatError(400,"Cidade inválida");
   const min = minDays == null ? null : integer(minDays,0,36500);
   const max = maxDays == null ? null : integer(maxDays,0,36500);
@@ -34,19 +34,19 @@ export async function selectAudience(scope: Scope, filters: Filters) {
   const { rows } = await satDb().query(`SELECT s.customer,s.phone FROM sat_consent s WHERE s.company=$1 AND s.promotional AND NOT s.opted_out
     AND s.phone IS NOT NULL AND NOT EXISTS (
       SELECT 1 FROM sat_consent opposition WHERE opposition.company=s.company AND opposition.phone=s.phone AND opposition.opted_out)
-    AND ($2::text IS NULL OR EXISTS (SELECT 1 FROM sat_ledger l WHERE l.company=s.company AND l.customer=s.customer
-      AND ($3::integer[] IS NULL OR branch=ANY($3)) AND kind='credit' AND available_at<=now() AND expires_at>now()
-      AND ($4::integer IS NULL OR expires_at<=now()+$4*interval '1 day')
-      AND NOT EXISTS (SELECT 1 FROM sat_ledger r WHERE r.company=l.company AND r.sale_date=l.sale_date
-        AND r.sale_id=l.sale_id AND r.kind='reversal')))
-    AND ($5::integer IS NULL OR s.customer=$5)
-    ORDER BY customer LIMIT 10001`, [scope.company,wallet ?? null,scope.branches,expiry,customerId]);
+    AND ($2::integer IS NULL OR s.customer=$2)
+    ORDER BY customer LIMIT 10001`, [scope.company,customerId]);
   if (rows.length > 10000) throw new SatError(409,"Público autorizado acima do limite de auditoria desta prévia");
   const customers: number[] = [];
   const destinations = new Set<string>();
   for (let offset=0; offset<rows.length; offset+=200) {
     const matchingPhones = new Map(rows.slice(offset,offset+200).map(row => [row.customer,row.phone]));
-    const ids = Array.from(matchingPhones.keys());
+    let ids = Array.from(matchingPhones.keys());
+    if (walletFilter) {
+      const withWallet = await walletCustomers(scope,ids,walletFilter,expiry);
+      ids = ids.filter(id => withWallet.has(id));
+      if (!ids.length) continue;
+    }
     const result = await readErp<(Candidate & { LAST_PURCHASE: string | null })>(`SELECT c.CODCLI,TRIM(c.CIDR) CITY,${clientPhone} PHONE,
       DATEDIFF(DAY FROM CAST(MAX(o.DATA) AS DATE) TO CURRENT_DATE) DAYS,
       CAST(CAST(MAX(o.DATA) AS DATE) AS VARCHAR(10)) LAST_PURCHASE,

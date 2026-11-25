@@ -32,46 +32,30 @@ async function run() {
         method, headers: { "Content-Type": "application/json", ...headers }, body: body && JSON.stringify(body),
       });
       assert.equal(response.status,status,url);
-      return status === 204 ? null : response.json();
+      return status === 204 || !(response.headers.get("content-type") || "").includes("json") ? null : response.json();
     };
     const [sale] = await readErp(`SELECT FIRST 1 CAST(CAST(o.DATA AS DATE) AS VARCHAR(10)) DIA,o.ID_OE,o.LOJA,o.CODCLI
       FROM OE o JOIN CLI c ON c.CODCLI=o.CODCLI WHERE o.TIPO='V' AND o.LOJA>0 AND COALESCE(TRIM(o.CANC),'')=''
-      AND COALESCE(o.STATUS,0)=0 AND COALESCE(o.TOTALDOPEDIDO,o.TOTAL)>=1
-      AND COALESCE(o.VALOR_CASHBACK_GERADO,0)=0 AND COALESCE(o.VALOR_CASHBACK_NUMMUS,0)=0 AND COALESCE(o.VALOR_CASHBACK,0)=0
-      AND NOT EXISTS (SELECT 1 FROM CLIENTES_CASHBACK b WHERE b.ID_OE=o.ID_OE AND b.DATA_OE=o.DATA)
-      AND NOT EXISTS (SELECT 1 FROM IOE i WHERE i.DATA=o.DATA AND i.ID_OE=o.ID_OE AND
-        (COALESCE(i.QUANT_DEVOLVIDO,0)>0 OR TRIM(i.DEVOLVIDO)='S' OR NULLIF(TRIM(i.CANC),'') IS NOT NULL))
-      ORDER BY o.DATA DESC,o.ID_OE DESC`);
-    assert.ok(sale,"Venda elegível necessária na cópia de teste do ERP");
-    await call("/rules/0",204,{ enabled:true,basisPoints:1000,minimumCents:0,maximumCents:10000,delayDays:0,validityDays:30,
-      startsOn:sale.DIA,redemptionLimitCents:1000,redemptionBasisPoints:5000 },"PUT");
+      AND COALESCE(o.STATUS,0)=0 ORDER BY o.DATA DESC,o.ID_OE DESC`);
+    assert.ok(sale,"Venda válida necessária na cópia de teste do ERP");
+    await call("/rules",200);
     await call("/clients",200);
     await call(`/clients/${sale.CODCLI}`,200);
     await call(`/clients/${sale.CODCLI}`,404,undefined,"GET",{ "x-test-branch": "1" });
     await call(`/dashboard?start=${sale.DIA}&end=${sale.DIA}`,200);
-    const payload = { date:sale.DIA,saleId:sale.ID_OE };
-    const preview = await call("/cashback/preview",200,payload);
-    const confirmation = { ...payload,saleCents:preview.saleCents,creditCents:preview.creditCents };
-    await call("/cashback",409,{ ...confirmation,creditCents:"0" });
-    const entry = await call("/cashback",201,confirmation);
-    assert.equal(preview.creditCents,entry.amount_cents);
-    await call("/cashback",409,confirmation);
-    const wallet = await call(`/clients/${sale.CODCLI}/cashback`,200);
-    assert.equal(wallet.balance.available,entry.amount_cents);
-    const pdv = { branch:sale.LOJA,customer:sale.CODCLI,orderCents:10000,amountCents:1,orderReference:"test-order" };
-    const demo = await call("/redemptions/authorize",201,pdv,"POST",{ "x-test-role":"pdv" });
-    assert.equal(demo.confirmed,false);
-    await call("/redemptions/authorize",409,pdv,"POST",{ "x-test-role":"pdv" });
-    await call(`/redemptions/${demo.id}/confirm`,409,{},"POST",{ "x-test-role":"pdv" });
-    await call(`/cashback/${entry.id}/reversal`,201,{});
-    await call(`/cashback/${entry.id}/reversal`,409,{});
-    const history = await call("/cashback",200);
-    assert.equal(history.rows.length,2);
-    const today = new Intl.DateTimeFormat("sv-SE",{timeZone:"America/Sao_Paulo"}).format(new Date());
-    const analytics = await call(`/dashboard/cashback?start=${today}&end=${today}`,200);
-    assert.equal(analytics.rows[0].generated,entry.amount_cents);
-    assert.equal(analytics.rows[0].available,"0");
-    await assert.rejects(db.query("UPDATE sat_ledger SET amount_cents=1"), { code: "P0001" });
+    const [credit] = await readErp(`SELECT FIRST 1 cb.CODCLI,CAST(CAST(cb.DATA_OE AS DATE) AS VARCHAR(10)) DIA
+      FROM CLIENTES_CASHBACK cb ORDER BY cb.COD DESC`);
+    if (credit) {
+      const wallet = await call(`/clients/${credit.CODCLI}/cashback`,200);
+      const history = await call(`/cashback?customer=${credit.CODCLI}`,200);
+      assert.ok(history.rows.length > 0);
+      const remaining = history.rows.filter(row => row.status === "disponível").reduce((sum,row) => sum+BigInt(row.remaining_cents),0n);
+      if (!history.more) assert.equal(wallet.balance.available,remaining.toString());
+      const analytics = await call(`/dashboard/cashback?start=${credit.DIA}&end=${credit.DIA}`,200);
+      assert.equal(analytics.rows.length,1);
+    }
+    await call("/cashback?status=pendente",400);
+    for (const removed of ["/cashback/process","/redemptions/authorize"]) await call(removed,404,{});
 
     const people = await readErp(`SELECT FIRST 300 c.CODCLI,${clientPhone} PHONE FROM CLI c WHERE ${clientPhone} IS NOT NULL ORDER BY c.CODCLI`);
     const person = people.find(candidate => normalizeBrazilianPhone(candidate.PHONE));
@@ -82,14 +66,10 @@ async function run() {
       await call(`/automations/${event}`,204,{ enabled:true,days:7,template:"Olá {{nome}}" },"PUT");
     }
     assert.equal((await call("/automations",200)).rows.length,6);
-    await db.query(`INSERT INTO sat_ledger (company,branch,customer,sale_date,sale_id,sale_cents,amount_cents,
-      kind,source,actor,available_at,expires_at) VALUES ($1,$2,$3,CURRENT_DATE,2147483647,100,10,
-      'credit','manual','5e86c313-22a5-4b56-891a-21e86eb5d6cc',now(),now()+interval '5 days')`,
-      [process.env.SAT_COMPANY_ID,sale.LOJA,person.CODCLI]);
     await enqueueAutomations(process.env.SAT_COMPANY_ID);
     await enqueueAutomations(process.env.SAT_COMPANY_ID);
-    const events = await db.query("SELECT event,count(*)::integer count FROM sat_automation_events GROUP BY event");
-    for (const event of ["granted","released","expiring"]) assert.equal(events.rows.find(row => row.event===event)?.count,1);
+    const duplicated = await db.query("SELECT event,event_key FROM sat_automation_events GROUP BY 1,2 HAVING count(*)>1");
+    assert.equal(duplicated.rows.length,0);
     await db.query("UPDATE sat_automations SET enabled=false");
     await db.query("UPDATE sat_message_queue SET status='skipped' WHERE status='queued'");
     assert.equal((await call("/audiences/preview",200,{})).count,1);
@@ -124,7 +104,7 @@ async function run() {
     } finally {
       await new Promise(resolve => provider.close(resolve));
     }
-    console.log("Integração SAT: clientes, dashboard, regras, ledger, resgate demonstrativo, consentimento e fila verificados.");
+    console.log("Integração SAT: clientes, dashboard, cashback do ERP, regras das lojas, consentimento, automações e fila verificados.");
   } finally {
     await new Promise(resolve => server.close(resolve));
     await db.end();

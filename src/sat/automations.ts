@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { readErp, validSale } from "./erp";
 import { satDb, transaction } from "./store";
+import { CreditEvent, creditEventCandidates } from "./cashback";
 
 export const automationEvents = ["granted","released","expiring","expired","inactive","birthday"] as const;
 type Event = typeof automationEvents[number];
@@ -12,23 +13,26 @@ const eventNames: Record<Event,string> = {
   expired: "Cashback expirado", inactive: "Cliente inativo", birthday: "Aniversário",
 };
 
-async function creditEvents(company: string, rule: Rule) {
-  const { rows } = await satDb().query<Candidate>(`SELECT l.customer,l.id::text AS event_key,l.id AS ledger_id
-    FROM sat_ledger l JOIN sat_consent s ON s.company=l.company AND s.customer=l.customer
-    WHERE l.company=$1 AND l.kind='credit' AND s.transactional AND NOT s.opted_out AND s.phone IS NOT NULL
-    AND CASE $2
-      WHEN 'granted' THEN l.created_at >= $3 AND l.expires_at > now()
-      WHEN 'released' THEN l.available_at BETWEEN $3 AND now() AND l.expires_at > now()
-      WHEN 'expiring' THEN l.available_at<=now() AND l.expires_at > now() AND l.expires_at <= now()+$4*interval '1 day'
-      WHEN 'expired' THEN l.expires_at BETWEEN $3 AND now() END
-    AND NOT EXISTS (SELECT 1 FROM sat_ledger reversal WHERE reversal.company=l.company AND reversal.sale_date=l.sale_date
-      AND reversal.sale_id=l.sale_id AND reversal.kind='reversal')
-    AND NOT EXISTS (SELECT 1 FROM sat_automation_events e WHERE e.company=l.company AND e.event=$2 AND e.event_key=l.id::text)
-    ORDER BY l.id LIMIT 100`, [company,rule.event,rule.active_since,rule.days]);
-  return rows;
-}
-
 const dayFormatter = new Intl.DateTimeFormat("sv-SE", { timeZone: "America/Sao_Paulo" });
+
+/* Créditos vêm de CLIENTES_CASHBACK no ERP; a chave do evento é o código do crédito (cb:COD). */
+async function creditEvents(company: string, rule: Rule) {
+  const consented = await satDb().query<{ customer: number }>(`SELECT s.customer FROM sat_consent s
+    WHERE s.company=$1 AND s.transactional AND NOT s.opted_out AND s.phone IS NOT NULL ORDER BY customer LIMIT 10001`, [company]);
+  if (consented.rows.length>10000) return [];
+  const since = dayFormatter.format(rule.active_since);
+  const result: Candidate[] = [];
+  for (let offset=0; offset<consented.rows.length && result.length<100; offset+=200) {
+    const ids = consented.rows.slice(offset,offset+200).map(row => row.customer);
+    const found = await creditEventCandidates(ids,rule.event as CreditEvent,since,rule.days);
+    if (!found.length) continue;
+    const done = await satDb().query<{ event_key: string }>(`SELECT event_key FROM sat_automation_events
+      WHERE company=$1 AND event=$2 AND event_key=ANY($3::text[])`, [company,rule.event,found.map(row => row.event_key)]);
+    const processed = new Set(done.rows.map(row => row.event_key));
+    result.push(...found.filter(row => !processed.has(row.event_key)));
+  }
+  return result.slice(0,100);
+}
 
 async function promotionalEvents(company: string, rule: Rule) {
   const today = dayFormatter.format(new Date());

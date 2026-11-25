@@ -9,7 +9,7 @@
     "build": "tsc",
     "start": "node dist/server.js",
     "db:local": "node scripts/start-local-postgres.cjs",
-    "test": "npm run build && node --test tests/sat.test.cjs"
+    "test": "npm run build && node -r dotenv/config --test tests/sat.test.cjs"
   },
   "keywords": [],
   "author": "",

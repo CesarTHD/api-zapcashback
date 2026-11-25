@@ -61,7 +61,12 @@ export async function dispatch(config: NonNullable<ReturnType<typeof configurati
     const number = customer?.PHONE ? normalizeBrazilianPhone(customer.PHONE) : null;
     const scope = { company: config.company, branches: message.branches, actor: message.actor };
     const wallet = await balances(scope,[message.customer]);
-    const formatted = new Intl.NumberFormat("pt-BR",{style:"currency",currency:"BRL"}).format(Number(wallet.get(message.customer)?.available || 0)/100);
+    const available = Number(wallet.get(message.customer)?.available || 0);
+    if (["granted","released","expiring"].includes(message.automation_event) && available <= 0) {
+      await db.query("UPDATE sat_message_queue SET status='skipped' WHERE id=$1 AND status='queued'", [message.id]);
+      return;
+    }
+    const formatted = new Intl.NumberFormat("pt-BR",{style:"currency",currency:"BRL"}).format(available/100);
     const text = message.template.replace(/\{\{(nome|saldo_cashback)\}\}/g, (_: string, field: string) =>
       field === "nome" ? customer?.NAME || "cliente" : formatted);
     const { rowCount } = await db.query(`UPDATE sat_message_queue q SET status='sending',attempted_at=now(),attempts=attempts+1

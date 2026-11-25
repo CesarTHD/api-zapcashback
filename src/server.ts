@@ -4,7 +4,6 @@ import Express from "express";
 import cors from "cors";
 import satRoutes from "./routes/sat";
 import { startSatMessaging } from "./sat/messaging";
-import { startSatGeneration } from "./sat/cashback";
 import { startSatAutomations } from "./sat/automations";
 
 dns.setDefaultResultOrder("ipv4first");
@@ -20,6 +19,5 @@ app.use("/sat", satRoutes);
 app.listen(PORT, () => {
   console.log(`API rodando na porta ${PORT}`);
   startSatMessaging();
-  startSatGeneration();
   startSatAutomations();
 });

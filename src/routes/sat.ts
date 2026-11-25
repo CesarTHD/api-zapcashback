@@ -2,7 +2,8 @@ import { Router, ErrorRequestHandler } from "express";
 import auth from "../middleware/authMiddleware";
 import { access, day, integer, SatError } from "../sat/access";
 import { branchFilter, clientFields, clientList, clientPhone, clientSales, clientScope, readErp, saleAmount, validSale } from "../sat/erp";
-import { balances, grant, processSales } from "../sat/cashback";
+import { balances, cashbackRules, cbFrom, cbListFields, cbListFrom, cbStatusFilters, cbSummary, entryRow, expiringCredits,
+  summaryRow } from "../sat/cashback";
 import { satDb } from "../sat/store";
 import { normalizeBrazilianPhone, selectAudience } from "../sat/audience";
 import { queueCampaign } from "../sat/messaging";
@@ -148,17 +149,13 @@ router.get("/clients/:id/cashback", async (req, res) => {
   const [map, consent, credits, messages] = await Promise.all([
     balances(scope,[id]),
     satDb().query("SELECT promotional,transactional,opted_out FROM sat_consent WHERE company=$1 AND customer=$2", [scope.company,id]),
-    satDb().query(`SELECT l.id,l.branch,l.amount_cents,l.expires_at FROM sat_ledger l
-      WHERE l.company=$1 AND l.customer=$2 AND ($3::integer[] IS NULL OR l.branch=ANY($3))
-      AND l.kind='credit' AND l.available_at<=now() AND l.expires_at>now()
-      AND NOT EXISTS (SELECT 1 FROM sat_ledger r WHERE r.company=l.company AND r.sale_date=l.sale_date AND r.sale_id=l.sale_id
-        AND r.kind='reversal') ORDER BY l.expires_at LIMIT 10`, [scope.company,id,scope.branches]),
+    expiringCredits(scope,id),
     satDb().query(`SELECT q.id,q.status,q.attempted_at,q.provider_status,c.name FROM sat_message_queue q
       JOIN sat_campaigns c ON c.id=q.campaign WHERE c.company=$1 AND q.customer=$2
       AND ($3::integer[] IS NULL OR c.branches<@$3) ORDER BY q.id DESC LIMIT 20`, [scope.company,id,scope.branches]),
   ]);
-  res.json({ balance: map.get(id) ?? { available: "0", pending: "0", expired: "0", generated: "0" },
-    consent: consent.rows[0] ?? null, credits: credits.rows, messages: messages.rows });
+  res.json({ balance: map.get(id) ?? summaryRow(),
+    consent: consent.rows[0] ?? null, credits, messages: messages.rows });
 });
 
 router.put("/clients/:id/consent", async (req, res) => {
@@ -231,19 +228,11 @@ router.get("/dashboard/cashback", async (req, res) => {
   if (span < 0 || span > 365) throw new SatError(400,"Selecione até 366 dias");
   const branch = req.query.branch === undefined ? undefined : integer(req.query.branch,1,32767);
   if (branch && scope.branches && !scope.branches.includes(branch)) throw new SatError(403,"Filial não autorizada");
-  const { rows } = await satDb().query(`WITH credit AS (
-    SELECT l.*, CAST(l.created_at AT TIME ZONE 'America/Sao_Paulo' AS date) event_day,
-      EXISTS (SELECT 1 FROM sat_ledger r WHERE r.company=l.company AND r.sale_date=l.sale_date AND
-        r.sale_id=l.sale_id AND r.kind='reversal') reversed
-    FROM sat_ledger l WHERE company=$1 AND ($2::integer[] IS NULL OR branch=ANY($2)) AND kind='credit'
-    AND l.created_at >= ($3::date::timestamp AT TIME ZONE 'America/Sao_Paulo')
-    AND l.created_at < (($4::date+1)::timestamp AT TIME ZONE 'America/Sao_Paulo'))
-    SELECT to_char(event_day,'YYYY-MM-DD') AS day, SUM(amount_cents) AS generated,
-      COALESCE(SUM(amount_cents) FILTER (WHERE NOT reversed AND available_at<=now() AND expires_at>now()),0) available,
-      COALESCE(SUM(amount_cents) FILTER (WHERE NOT reversed AND available_at>now()),0) pending,
-      COALESCE(SUM(amount_cents) FILTER (WHERE NOT reversed AND expires_at<=now()),0) expired
-    FROM credit GROUP BY event_day ORDER BY event_day`, [scope.company,branch ? [branch] : scope.branches,start,end]);
-  res.json({ rows });
+  const branches = branch ? [branch] : scope.branches;
+  const rows = await readErp<Record<string, string>>(`SELECT CAST(CAST(cb.DATA_OE AS DATE) AS VARCHAR(10)) DIA, ${cbSummary}
+    ${cbFrom} WHERE cb.DATA_OE>=CAST(? AS DATE) AND cb.DATA_OE<DATEADD(1 DAY TO CAST(? AS DATE))${branchFilter(branches)}
+    GROUP BY 1 ORDER BY 1`, [start,end,...(branches || [])], true);
+  res.json({ rows: rows.map(row => ({ day: row.DIA, ...summaryRow(row) })) });
 });
 
 router.get("/cashback", async (req, res) => {
@@ -256,117 +245,26 @@ router.get("/cashback", async (req, res) => {
   const end = req.query.end === undefined ? null : day(req.query.end);
   if (start && end && start>end) throw new SatError(400,"Período inválido");
   const status = req.query.status === undefined ? null : input(req.query.status);
-  if (status !== null && !["disponível","pendente","expirado","estornado","estorno"].includes(status)) {
-    throw new SatError(400,"Status inválido");
+  if (status !== null && !(status in cbStatusFilters)) throw new SatError(400,"Status inválido");
+  const branches = branch ? [branch] : scope.branches;
+  const where: string[] = ["1=1"];
+  const params: (string | number)[] = [offset];
+  if (customer !== null) { where.push("cb.CODCLI=?"); params.push(customer); }
+  const search = input(req.query.q);
+  if (search) {
+    where.push("(c.CLI CONTAINING ? OR c.CPF CONTAINING ? OR c.TELR CONTAINING ? OR c.TEL1 CONTAINING ? OR c.TEL2 CONTAINING ?)");
+    params.push(search,search,search,search,search);
   }
-  const { rows } = await satDb().query(`WITH entries AS (SELECT l.id,branch,customer,to_char(sale_date,'YYYY-MM-DD') sale_date,
-    sale_id,sale_cents,amount_cents,kind,source,created_at,available_at,expires_at,
-    CASE WHEN kind='reversal' THEN 'estorno' WHEN EXISTS (SELECT 1 FROM sat_ledger r WHERE
-      r.company=l.company AND r.sale_date=l.sale_date AND r.sale_id=l.sale_id AND r.kind='reversal')
-      THEN 'estornado' WHEN expires_at<=now() THEN 'expirado' WHEN available_at>now() THEN 'pendente'
-      ELSE 'disponível' END status
-    FROM sat_ledger l WHERE company=$1 AND ($2::integer[] IS NULL OR branch=ANY($2))
-    AND ($3::integer IS NULL OR customer=$3) AND ($5::date IS NULL OR sale_date >= $5)
-    AND ($6::date IS NULL OR sale_date <= $6))
-    SELECT * FROM entries WHERE ($7::text IS NULL OR status=$7) ORDER BY id DESC LIMIT 51 OFFSET $4`,
-    [scope.company,branch ? [branch] : scope.branches,customer,offset,start,end,status]);
-  res.json({ rows: rows.slice(0,50), more: rows.length>50 });
+  if (start) { where.push("cb.DATA_OE>=CAST(? AS DATE)"); params.push(start); }
+  if (end) { where.push("cb.DATA_OE<DATEADD(1 DAY TO CAST(? AS DATE))"); params.push(end); }
+  if (status) where.push(cbStatusFilters[status]);
+  const rows = await readErp<Parameters<typeof entryRow>[0]>(`SELECT FIRST 51 SKIP ? ${cbListFields()} ${cbListFrom}
+    WHERE ${where.join(" AND ")}${branchFilter(branches)} ORDER BY cb.COD DESC`, [...params,...(branches || [])], true);
+  res.json({ rows: rows.slice(0,50).map(entryRow), more: rows.length>50 });
 });
 
 router.get("/rules", async (req, res) => {
-  const scope = access(req,"admin");
-  const { rows } = await satDb().query(`SELECT branch,enabled,basis_points,minimum_cents,maximum_cents,delay_days,
-    validity_days,to_char(starts_on,'YYYY-MM-DD') starts_on,redemption_limit_cents,redemption_basis_points
-    FROM sat_rules WHERE company=$1 AND ($2::integer[] IS NULL OR branch=ANY($2)) ORDER BY branch`,
-    [scope.company,scope.branches]);
-  res.json({ rows });
-});
-
-router.post("/cashback/preview", async (req, res) => {
-  const scope = access(req,"operator");
-  const preview = await grant(scope,day(req.body?.date),integer(req.body?.saleId,0,2147483647),true,"manual");
-  const wallets = await balances({ ...scope, branches:[preview.branch] },[preview.customer]);
-  res.json({ ...preview, availableCents: wallets.get(preview.customer)?.available ?? "0" });
-});
-
-router.post("/cashback", async (req, res) => {
-  const scope = access(req,"operator");
-  const { saleCents, creditCents } = req.body ?? {};
-  if ([saleCents, creditCents].some(value => typeof value !== "string" || !/^\d{1,17}$/.test(value))) {
-    throw new SatError(400,"Simule o cashback antes de confirmar");
-  }
-  res.status(201).json(await grant(scope,day(req.body?.date),integer(req.body?.saleId,0,2147483647),false,"manual",
-    { saleCents, creditCents }));
-});
-
-router.post("/cashback/process", async (req, res) => {
-  const scope = access(req,"admin");
-  const date = day(req.body?.date);
-  const after = integer(req.body?.after ?? 0,0,2147483647);
-  res.json(await processSales(scope,date,after));
-});
-
-router.post("/cashback/:id/reversal", async (req, res) => {
-  const scope = access(req,"admin");
-  const id = integer(req.params.id,1,Number.MAX_SAFE_INTEGER);
-  const { rows: [entry] } = await satDb().query(`INSERT INTO sat_ledger
-    (company,branch,customer,sale_date,sale_id,sale_cents,amount_cents,kind,source,actor,available_at,expires_at)
-    SELECT company,branch,customer,sale_date,sale_id,sale_cents,amount_cents,'reversal','manual',$4,available_at,expires_at
-    FROM sat_ledger WHERE company=$1 AND id=$2 AND kind='credit' AND ($3::integer[] IS NULL OR branch=ANY($3))
-    ON CONFLICT (company,sale_date,sale_id,kind) DO NOTHING RETURNING id`, [scope.company,id,scope.branches,scope.actor]);
-  if (!entry) throw new SatError(409,"Crédito indisponível para estorno");
-  res.status(201).json(entry);
-});
-
-router.put("/rules/:branch", async (req, res) => {
-  const scope = access(req,"admin");
-  const branch = integer(req.params.branch,0,32767);
-  if (scope.branches && !scope.branches.includes(branch)) throw new SatError(403,"Filial não autorizada");
-  const { enabled, basisPoints, minimumCents, maximumCents, delayDays, validityDays, startsOn,
-    redemptionLimitCents, redemptionBasisPoints } = req.body ?? {};
-  if (typeof enabled !== "boolean") throw new SatError(400,"Estado do programa inválido");
-  await satDb().query(`INSERT INTO sat_rules (company,branch,enabled,basis_points,minimum_cents,maximum_cents,delay_days,validity_days,starts_on,redemption_limit_cents,redemption_basis_points)
-    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) ON CONFLICT(company,branch) DO UPDATE SET
-    enabled=excluded.enabled,basis_points=excluded.basis_points,minimum_cents=excluded.minimum_cents,
-    maximum_cents=excluded.maximum_cents,delay_days=excluded.delay_days,validity_days=excluded.validity_days,
-    starts_on=excluded.starts_on,redemption_limit_cents=excluded.redemption_limit_cents,
-    redemption_basis_points=excluded.redemption_basis_points`, [scope.company,branch,enabled,integer(basisPoints,0,10000),
-    integer(minimumCents,0,Number.MAX_SAFE_INTEGER),integer(maximumCents,1,Number.MAX_SAFE_INTEGER),
-    integer(delayDays,0,365),integer(validityDays,1,3650),day(startsOn),
-    redemptionLimitCents == null ? null : integer(redemptionLimitCents,1,Number.MAX_SAFE_INTEGER),
-    redemptionBasisPoints == null ? null : integer(redemptionBasisPoints,1,10000)]);
-  res.sendStatus(204);
-});
-
-router.post("/redemptions/authorize", async (req, res) => {
-  const scope = access(req,"pdv");
-  const branch = integer(req.body?.branch,1,32767);
-  if (scope.branches && !scope.branches.includes(branch)) throw new SatError(403,"Filial não autorizada");
-  const customer = integer(req.body?.customer,0,2147483647);
-  const orderCents = integer(req.body?.orderCents,1,Number.MAX_SAFE_INTEGER);
-  const amount = integer(req.body?.amountCents,1,orderCents);
-  const reference = input(req.body?.orderReference);
-  if (!reference || reference !== req.body?.orderReference) throw new SatError(400,"Referência inválida");
-  const { rows: [rule] } = await satDb().query(`SELECT enabled,redemption_limit_cents,redemption_basis_points FROM sat_rules
-    WHERE company=$1 AND branch IN (0,$2) ORDER BY branch DESC LIMIT 1`, [scope.company,branch]);
-  if (!rule?.enabled || !rule.redemption_basis_points || !rule.redemption_limit_cents ||
-    BigInt(amount) > BigInt(rule.redemption_limit_cents) ||
-    BigInt(amount)*10000n > BigInt(orderCents)*BigInt(rule.redemption_basis_points)) {
-    throw new SatError(409,"Resgate fora dos limites configurados");
-  }
-  const wallet = await balances({ ...scope, branches: [branch] },[customer]);
-  if (BigInt(wallet.get(customer)?.available ?? 0) < BigInt(amount)) throw new SatError(409,"Saldo insuficiente");
-  const { rows: [entry] } = await satDb().query(`INSERT INTO sat_redemption_demo
-    (company,branch,customer,order_reference,order_cents,amount_cents,actor) VALUES ($1,$2,$3,$4,$5,$6,$7)
-    ON CONFLICT(company,branch,order_reference) DO NOTHING RETURNING id`,
-    [scope.company,branch,customer,reference,orderCents,amount,scope.actor]);
-  if (!entry) throw new SatError(409,"Simulação já registrada para esse pedido");
-  res.status(201).json({ id: entry.id, status: "demonstrativo", reserved: false, confirmed: false });
-});
-
-router.post("/redemptions/:id/confirm", (req, _res) => {
-  access(req,"pdv");
-  throw new SatError(409,"Confirmação desativada até integração com o fechamento da venda no PDV");
+  res.json({ rows: await cashbackRules(access(req,"admin")) });
 });
 
 const handleError: ErrorRequestHandler = (error, req, res, _next) => {
