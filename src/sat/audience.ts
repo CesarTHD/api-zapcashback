@@ -15,8 +15,9 @@ export function normalizeBrazilianPhone(phone: string) {
 
 export async function selectAudience(scope: Scope, filters: Filters) {
   const { city, minDays, maxDays, minPurchases, minSpentCents, minTicketCents, lastPurchaseFrom, lastPurchaseTo,
-    wallet, expiresWithinDays, customer } = filters;
+    wallet, expiresWithinDays, customer, productCodes } = filters;
   const customerId = customer == null ? null : integer(customer,0,2147483647);
+  const products = parseProductCodes(productCodes);
   const walletFilter = wallet === undefined ? null : walletFilters.find(name => name === wallet);
   if (walletFilter === undefined) throw new SatError(400,"Filtro de cashback inválido");
   if (city !== undefined && (typeof city !== "string" || city.length > 100)) throw new SatError(400,"Cidade inválida");
@@ -47,6 +48,11 @@ export async function selectAudience(scope: Scope, filters: Filters) {
       ids = ids.filter(id => withWallet.has(id));
       if (!ids.length) continue;
     }
+    if (products.length) {
+      const buyers = await productBuyers(scope,ids,products);
+      ids = ids.filter(id => buyers.has(id));
+      if (!ids.length) continue;
+    }
     const result = await readErp<(Candidate & { LAST_PURCHASE: string | null })>(`SELECT c.CODCLI,TRIM(c.CIDR) CITY,${clientPhone} PHONE,
       DATEDIFF(DAY FROM CAST(MAX(o.DATA) AS DATE) TO CURRENT_DATE) DAYS,
       CAST(CAST(MAX(o.DATA) AS DATE) AS VARCHAR(10)) LAST_PURCHASE,
@@ -74,4 +80,21 @@ export async function selectAudience(scope: Scope, filters: Filters) {
     }
   }
   return customers;
+}
+
+/* Códigos de produto (PROD.COD / IOE.COD) separados por vírgula, espaço ou ponto e vírgula; até 20. */
+function parseProductCodes(value: unknown) {
+  if (value == null || value === "") return [];
+  const parts = (Array.isArray(value) ? value : String(value).split(/[\s,;]+/)).filter(part => part !== "");
+  if (parts.length > 20) throw new SatError(400,"Informe até 20 códigos de produto");
+  return [...new Set(parts.map(part => integer(part,0,2147483647)))];
+}
+
+async function productBuyers(scope: Scope, customers: number[], products: number[]) {
+  const rows = await readErp<{ CODCLI: number }>(`SELECT DISTINCT o.CODCLI FROM OE o
+    JOIN IOE i ON i.DATA=o.DATA AND i.ID_OE=o.ID_OE
+    WHERE o.CODCLI IN (${customers.map(() => "?").join(",")}) AND ${validSale}${branchFilter(scope.branches)}
+    AND i.COD IN (${products.map(() => "?").join(",")}) AND NULLIF(TRIM(i.CANC),'') IS NULL`,
+    [...customers,...(scope.branches || []),...products]);
+  return new Set(rows.map(row => row.CODCLI));
 }

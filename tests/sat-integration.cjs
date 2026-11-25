@@ -80,6 +80,11 @@ async function run() {
     await db.query("UPDATE sat_automations SET enabled=false");
     await db.query("UPDATE sat_message_queue SET status='skipped' WHERE status='queued'");
     assert.equal((await call("/audiences/preview",200,{})).count,1);
+    const [bought] = await readErp(`SELECT FIRST 1 i.COD FROM OE o JOIN IOE i ON i.DATA=o.DATA AND i.ID_OE=o.ID_OE
+      WHERE o.CODCLI=? AND o.TIPO='V' AND COALESCE(TRIM(o.CANC),'')='' AND COALESCE(o.STATUS,0)=0 AND NULLIF(TRIM(i.CANC),'') IS NULL`,[person.CODCLI]);
+    if (bought) assert.equal((await call("/audiences/preview",200,{ productCodes:String(bought.COD) })).count,1);
+    assert.equal((await call("/audiences/preview",200,{ productCodes:"2147483647" })).count,0);
+    await call("/audiences/preview",400,{ productCodes:"x" });
     const campaign = { id:crypto.randomUUID(), name:"Integração local", template:"Olá {{nome}}. Seu saldo é {{saldo_cashback}}.",
       scheduleAt:new Date().toISOString(), filters:{} };
     assert.equal((await call("/campaigns",201,campaign)).recipients,1);
