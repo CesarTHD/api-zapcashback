@@ -60,6 +60,8 @@ async function run() {
     const xlsx = await fetch(`http://127.0.0.1:${server.address().port}/clients/export.xlsx`);
     assert.equal(xlsx.status,200);
     assert.equal(Buffer.from(await xlsx.arrayBuffer()).subarray(0,2).toString(),"PK");
+    const dashboard = await call(`/dashboard?start=${sale.DIA}&end=${sale.DIA}`,200);
+    assert.ok("CASHBACK_GERADO" in dashboard.totals && "FATURAMENTO_COM_RESGATE" in dashboard.totals);
     for (const removed of ["/cashback/process","/redemptions/authorize"]) await call(removed,404,{});
 
     const people = await readErp(`SELECT FIRST 300 c.CODCLI,${clientPhone} PHONE FROM CLI c WHERE ${clientPhone} IS NOT NULL ORDER BY c.CODCLI`);
