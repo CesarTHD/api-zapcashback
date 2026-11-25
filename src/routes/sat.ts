@@ -1,8 +1,9 @@
-import { Router, ErrorRequestHandler } from "express";
+import { Router, ErrorRequestHandler, Request } from "express";
+import ExcelJS from "exceljs";
 import auth from "../middleware/authMiddleware";
 import { access, day, integer, SatError } from "../sat/access";
 import { branchFilter, clientFields, clientList, clientPhone, clientSales, clientScope, readErp, saleAmount, validSale } from "../sat/erp";
-import { balances, cashbackRules, cbFrom, cbListFields, cbListFrom, cbStatusFilters, cbSummary, entryRow, expiringCredits,
+import { balances, cashbackRules, cbExpired, cbFrom, cbListFields, cbListFrom, cbOpen, cbStatusFilters, cbSummary, entryRow, expiringCredits,
   summaryRow } from "../sat/cashback";
 import { satDb } from "../sat/store";
 import { normalizeBrazilianPhone, selectAudience } from "../sat/audience";
@@ -96,17 +97,62 @@ router.get("/clients", async (req, res) => {
   res.json({ rows: visible, more: rows.length > 50 });
 });
 
-router.get("/clients/export.csv", async (req, res) => {
+const exportFields: [string, string][] = [["CODCLI","Código"],["NOME","Nome"],["CPF","Documento"],["CIDADE","Cidade"],
+  ["TELEFONE","Telefone"],["NASCIMENTO","Nascimento"],["COMPRAS","Compras"],["TOTAL_GASTO","Total gasto"],
+  ["ULTIMA_COMPRA","Última compra"],["DIAS_SEM_COMPRAR","Dias sem comprar"]];
+
+async function exportRows(req: Request) {
   const scope = access(req);
   const rows = await clientList(scope.branches, input(req.query.q), input(req.query.city), 5001, 0, input(req.query.sort));
   if (rows.length > 5000) throw new SatError(400,"Refine os filtros para exportar até 5.000 clientes");
-  const fields = ["CODCLI","NOME","CPF","CIDADE","TELEFONE","NASCIMENTO","COMPRAS","TOTAL_GASTO","ULTIMA_COMPRA","DIAS_SEM_COMPRAR"];
+  return rows as Record<string, unknown>[];
+}
+
+router.get("/clients/export.csv", async (req, res) => {
+  const rows = await exportRows(req);
   const escape = (value: unknown) => {
     const string = String(value ?? "");
     return '"' + (/^[\s]*[=+\-@]/.test(string) || /^[\r\n\t]/.test(string) ? "'" : "") + string.replace(/"/g,'""') + '"';
   };
-  res.attachment("clientes-sat.csv").type("text/csv").send("\uFEFF" + [fields.join(";"), ...rows.map(row =>
-    fields.map(f => escape((row as Record<string, unknown>)[f])).join(";"))].join("\r\n"));
+  res.attachment("clientes-sat.csv").type("text/csv").send("\uFEFF" + [exportFields.map(([f]) => f).join(";"), ...rows.map(row =>
+    exportFields.map(([f]) => escape(row[f])).join(";"))].join("\r\n"));
+});
+
+router.get("/clients/export.xlsx", async (req, res) => {
+  const rows = await exportRows(req);
+  const book = new ExcelJS.Workbook();
+  const sheet = book.addWorksheet("Clientes");
+  sheet.columns = exportFields.map(([key,header]) => ({ key, header, width: key === "NOME" ? 36 : 16 }));
+  sheet.getRow(1).font = { bold: true };
+  sheet.views = [{ state: "frozen", ySplit: 1 }];
+  // Células recebem valores tipados; texto nunca é interpretado como fórmula pelo exceljs.
+  for (const row of rows) sheet.addRow(Object.fromEntries(exportFields.map(([key]) => {
+    const value = row[key];
+    if (["COMPRAS","TOTAL_GASTO","DIAS_SEM_COMPRAR"].includes(key)) return [key, value == null ? null : Number(value)];
+    return [key, value == null ? null : String(value)];
+  })));
+  sheet.getColumn("TOTAL_GASTO").numFmt = '"R$" #,##0.00';
+  res.attachment("clientes-sat.xlsx").type("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+  res.send(Buffer.from(await book.xlsx.writeBuffer()));
+});
+
+router.get("/clients/summary", async (req, res) => {
+  const scope = access(req);
+  const branches = scope.branches;
+  const [[clients], [active], [wallet]] = await Promise.all([
+    readErp<Record<string, number>>(`SELECT COUNT(*) TOTAL,
+      COUNT(CASE WHEN c.NAS>DATE '1900-01-01' AND EXTRACT(MONTH FROM c.NAS)=EXTRACT(MONTH FROM CURRENT_DATE) THEN 1 END) ANIVERSARIANTES
+      FROM CLI c WHERE 1=1${clientScope(branches)}`, branches || []),
+    readErp<Record<string, number>>(`SELECT COUNT(DISTINCT o.CODCLI) ATIVOS FROM OE o
+      WHERE o.DATA>=DATEADD(-90 DAY TO CURRENT_DATE) AND ${validSale}${branchFilter(branches)}`, branches || []),
+    readErp<Record<string, number>>(`SELECT COUNT(DISTINCT cb.CODCLI) COM_SALDO ${cbFrom}
+      WHERE ${cbOpen} AND NOT ${cbExpired}${branchFilter(branches)}`, branches || []),
+  ]);
+  const consent = process.env.SAT_DATABASE_URL ? (await satDb().query<{ total: string }>(
+    "SELECT count(*) total FROM sat_consent WHERE company=$1 AND promotional AND NOT opted_out AND phone IS NOT NULL",
+    [scope.company])).rows[0].total : null;
+  res.json({ total: clients.TOTAL, birthdays: clients.ANIVERSARIANTES, active90: active.ATIVOS,
+    withCashback: wallet.COM_SALDO, whatsapp: consent === null ? null : Number(consent) });
 });
 
 router.get("/clients/:id", async (req, res) => {
