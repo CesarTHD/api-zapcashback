@@ -2,10 +2,11 @@ import { Router, ErrorRequestHandler, Request } from "express";
 import ExcelJS from "exceljs";
 import auth from "../middleware/authMiddleware";
 import { access, day, integer, SatError } from "../sat/access";
-import { branchFilter, clientFields, clientList, clientPhone, clientSales, clientScope, readErp, saleAmount, validSale } from "../sat/erp";
+import { branchFilter, clientFields, erpWriteEnabled, clientList, clientPhone, clientSales, clientScope, readErp, saleAmount, validSale } from "../sat/erp";
 import { balances, cashbackRules, cbExpired, cbFrom, cbListFields, cbListFrom, cbOpen, cbStatusFilters, cbSummary, entryRow, expiringCredits,
   summaryRow } from "../sat/cashback";
 import { satDb } from "../sat/store";
+import { launchCredit, listOperations, previewCredit, redeemCredit } from "../sat/operations";
 import { normalizeBrazilianPhone, selectAudience } from "../sat/audience";
 import { queueCampaign } from "../sat/messaging";
 import { automationEvents } from "../sat/automations";
@@ -16,7 +17,7 @@ const input = (value: unknown) => typeof value === "string" ? value.trim().slice
 
 router.get("/access", (req, res) => {
   const scope = access(req);
-  res.json({ role: scope.role, branches: scope.branches });
+  res.json({ role: scope.role, branches: scope.branches, erpWrite: erpWriteEnabled() });
 });
 
 router.post("/audiences/preview", async (req, res) => {
@@ -317,6 +318,32 @@ router.get("/cashback", async (req, res) => {
   res.json({ rows: rows.slice(0,50).map(entryRow), more: rows.length>50 });
 });
 
+router.post("/cashback/preview", async (req, res) => {
+  const scope = access(req,"operator");
+  res.json(await previewCredit(scope,day(req.body?.date),integer(req.body?.saleId,0,2147483647)));
+});
+
+router.post("/cashback", async (req, res) => {
+  const scope = access(req,"operator");
+  const creditCents = req.body?.creditCents;
+  if (typeof creditCents !== "string" || !/^\d{1,15}$/.test(creditCents)) throw new SatError(400,"Simule o cashback antes de confirmar");
+  res.status(201).json(await launchCredit(scope,day(req.body?.date),integer(req.body?.saleId,0,2147483647),creditCents));
+});
+
+router.post("/cashback/redemptions", async (req, res) => {
+  const scope = access(req,"operator");
+  const customer = integer(req.body?.customer,0,2147483647);
+  const amount = BigInt(integer(req.body?.amountCents,1,100000000));
+  const reference = input(req.body?.reference) || null;
+  res.status(201).json(await redeemCredit(scope,customer,amount,reference));
+});
+
+router.get("/cashback/operations", async (req, res) => {
+  const scope = access(req);
+  const customer = req.query.customer === undefined ? null : integer(req.query.customer,0,2147483647);
+  res.json({ rows: await listOperations(scope,customer) });
+});
+
 router.get("/rules", async (req, res) => {
   res.json({ rows: await cashbackRules(access(req,"admin")) });
 });
@@ -324,6 +351,15 @@ router.get("/rules", async (req, res) => {
 const handleError: ErrorRequestHandler = (error, req, res, _next) => {
   if (error instanceof SatError) {
     res.status(error.status).json({ error: error.message });
+    return;
+  }
+  if (error?.code === "SAT_ERP_WRITE_DISABLED") {
+    res.status(409).json({ error: "A gravação no ERP está desativada nesta instalação (SAT_ERP_WRITE)." });
+    return;
+  }
+  // 335544345 lock conflict, 335544336 deadlock, 335544878 update conflict: outro processo está alterando o mesmo registro.
+  if ([335544345,335544336,335544878].includes(error?.gdscode)) {
+    res.status(409).json({ error: "O registro está em uso no ERP. Tente novamente em instantes." });
     return;
   }
   console.error("Falha SAT", req.method, req.route?.path ?? "", error?.code ?? error?.gdscode ?? "sem código");

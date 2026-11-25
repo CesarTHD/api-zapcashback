@@ -59,7 +59,8 @@ async function provision() {
   const database = new Client({ ...connection, database: "sat_cashback" });
   try {
     await database.connect();
-    await database.query(fs.readFileSync(path.join(api,"migrations","001_sat.sql"),"utf8"));
+    const migrations = fs.readdirSync(path.join(api,"migrations")).filter(file => file.endsWith(".sql")).sort();
+    for (const file of migrations) await database.query(fs.readFileSync(path.join(api,"migrations",file),"utf8"));
     console.log("PostgreSQL SAT disponível em 127.0.0.1:55432/sat_cashback.");
   } finally { await database.end(); }
 }

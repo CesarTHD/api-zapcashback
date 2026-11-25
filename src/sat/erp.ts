@@ -1,33 +1,68 @@
-import { attach, ISOLATION_READ_COMMITTED_READ_ONLY, NUMERIC_MODE_STRING, Options, Database, Transaction } from "node-firebird";
+import { attach, ISOLATION_READ_COMMITTED, ISOLATION_READ_COMMITTED_READ_ONLY, NUMERIC_MODE_STRING, Options, Database, Transaction } from "node-firebird";
 
 export type Branches = number[] | null;
-type Parameter = string | number;
+type Parameter = string | number | null;
 
-export async function readErp<T>(sql: string, params: Parameter[] = [], exact = false): Promise<T[]> {
+function erpOptions(exact: boolean, write = false): Options {
   const options: Options = {
     host: process.env.SAT_DB_HOST || "localhost",
     port: Number(process.env.SAT_DB_PORT || 3050),
     database: process.env.SAT_DB_DATABASE || "",
-    user: process.env.SAT_DB_USER || "",
-    password: process.env.SAT_DB_PASSWORD || "",
+    // Gravações podem usar uma conta própria; leituras usam a conta (de preferência somente leitura) padrão.
+    user: (write && process.env.SAT_DB_WRITE_USER) || process.env.SAT_DB_USER || "",
+    password: (write && process.env.SAT_DB_WRITE_PASSWORD) || process.env.SAT_DB_PASSWORD || "",
     numericMode: exact ? NUMERIC_MODE_STRING : undefined,
     // O banco do SAT usa charset NONE com textos gravados em Windows-1252; sem isso, acentos chegam como "�".
     encoding: (process.env.SAT_DB_ENCODING || "WIN1252") as Options["encoding"],
   };
   if (!options.database || !options.user || !options.password) throw new Error("ERP indisponível");
-  const db = await new Promise<Database>((resolve, reject) => {
+  return options;
+}
+
+function connect(options: Options) {
+  return new Promise<Database>((resolve, reject) => {
     attach(options, (err, connection) => err ? reject(err) : resolve(connection));
   });
+}
+
+const run = <T>(tx: Transaction, sql: string, params: Parameter[]) => new Promise<T[]>((resolve, reject) => {
+  tx.query(sql, params, (err, rows) => err ? reject(err) : resolve((rows ?? []) as T[]));
+});
+
+export async function readErp<T>(sql: string, params: Parameter[] = [], exact = false): Promise<T[]> {
+  const db = await connect(erpOptions(exact));
   try {
     const tx = await new Promise<Transaction>((resolve, reject) => {
       db.transaction(ISOLATION_READ_COMMITTED_READ_ONLY, (err, transaction) => err ? reject(err) : resolve(transaction));
     });
     try {
-      return await new Promise<T[]>((resolve, reject) => {
-        tx.query(sql, params, (err, rows) => err ? reject(err) : resolve(rows as T[]));
-      });
+      return await run<T>(tx, sql, params);
     } finally {
       await new Promise<void>((resolve, reject) => tx.rollback(err => err ? reject(err) : resolve()));
+    }
+  } finally {
+    db.detach();
+  }
+}
+
+export const erpWriteEnabled = () => process.env.SAT_ERP_WRITE === "true";
+export type ErpQuery = <T>(sql: string, params?: Parameter[]) => Promise<T[]>;
+
+/** Executa `work` numa única transação de escrita no ERP: confirma se terminar, desfaz se lançar erro. */
+export async function writeErp<T>(work: (query: ErpQuery) => Promise<T>): Promise<T> {
+  if (!erpWriteEnabled()) throw Object.assign(new Error("Gravação no ERP desativada"), { code: "SAT_ERP_WRITE_DISABLED" });
+  const db = await connect(erpOptions(true, true));
+  try {
+    const tx = await new Promise<Transaction>((resolve, reject) => {
+      db.transaction(ISOLATION_READ_COMMITTED, (err, transaction) => err ? reject(err) : resolve(transaction));
+    });
+    try {
+      const result = await work((sql, params = []) => run(tx, sql, params));
+      await new Promise<void>((resolve, reject) => tx.commit(err => err ? reject(err) : resolve()));
+      return result;
+    } catch (error) {
+      await new Promise<void>(resolve => tx.rollback(() => resolve()));
+      throw error;
     }
   } finally {
     db.detach();

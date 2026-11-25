@@ -8,6 +8,7 @@ async function run() {
   assert.ok(process.env.SAT_TEST_DATABASE_URL, "Informe um banco PostgreSQL descartável");
   process.env.SAT_DATABASE_URL = process.env.SAT_TEST_DATABASE_URL;
   process.env.SAT_COMPANY_ID = "sat-integration-test";
+  process.env.SAT_ERP_WRITE = "false"; // o teste nunca grava no ERP
   const { satDb } = require("../dist/sat/store");
   const { clientPhone } = require("../dist/sat/erp");
   const { normalizeBrazilianPhone } = require("../dist/sat/audience");
@@ -26,7 +27,10 @@ async function run() {
   const server = app.listen(0,"127.0.0.1");
   try {
     await once(server,"listening");
-    await db.query(readFileSync(require.resolve("../migrations/001_sat.sql"),"utf8"));
+    const migrations = require("node:path").dirname(require.resolve("../migrations/001_sat.sql"));
+    for (const file of require("node:fs").readdirSync(migrations).filter(name => name.endsWith(".sql")).sort()) {
+      await db.query(readFileSync(require("node:path").join(migrations,file),"utf8"));
+    }
     const call = async (url, status, body, method = body ? "POST" : "GET", headers = {}) => {
       const response = await fetch(`http://127.0.0.1:${server.address().port}${url}`,{
         method, headers: { "Content-Type": "application/json", ...headers }, body: body && JSON.stringify(body),
@@ -55,6 +59,11 @@ async function run() {
       assert.equal(analytics.rows.length,1);
     }
     await call("/cashback?status=pendente",400);
+    assert.equal((await call("/access",200)).erpWrite,false);
+    await call("/cashback",409,{ date:sale.DIA,saleId:sale.ID_OE,creditCents:"1" });
+    await call("/cashback/redemptions",409,{ customer:sale.CODCLI,amountCents:1 });
+    await call("/cashback/redemptions",400,{ customer:sale.CODCLI,amountCents:0 });
+    assert.ok(Array.isArray((await call("/cashback/operations",200)).rows));
     const summary = await call("/clients/summary",200);
     assert.ok(summary.total >= summary.withCashback);
     const xlsx = await fetch(`http://127.0.0.1:${server.address().port}/clients/export.xlsx`);
