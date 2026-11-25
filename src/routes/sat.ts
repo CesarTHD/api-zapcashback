@@ -131,8 +131,10 @@ router.get("/clients/:id", async (req, res) => {
 
 router.get("/clients/:id/sales/:date/:sale/items", async (req, res) => {
   const scope = access(req);
-  const rows = await readErp(`SELECT FIRST 101 SKIP ? i.ID_ITEM,i.COD,TRIM(i.CLI) NOME,i.QUANT,
-    CAST(i.VALORTOTAL AS DECIMAL(15,2)) TOTAL,i.CANC,i.QUANT_DEVOLVIDO
+  const rows = await readErp(`SELECT FIRST 101 SKIP ? i.ID_ITEM,i.COD,
+    COALESCE(NULLIF(TRIM(i.NOME),''),(SELECT FIRST 1 TRIM(p.PRODUTO) FROM PROD p WHERE p.COD=i.COD)) NOME,
+    i.QUANT,CAST(COALESCE(i.VCON,i.VALOR) AS DECIMAL(15,2)) UNITARIO,CAST(COALESCE(i.VALORDESCONTO,0) AS DECIMAL(15,2)) DESCONTO,
+    CAST(i.VALORTOTAL AS DECIMAL(15,2)) TOTAL,NULLIF(TRIM(i.CANC),'') CANC,i.QUANT_DEVOLVIDO
     FROM OE o JOIN IOE i ON i.DATA=o.DATA AND i.ID_OE=o.ID_OE
     WHERE o.CODCLI=? AND o.DATA=CAST(? AS DATE) AND o.ID_OE=? AND ${validSale}${branchFilter(scope.branches)}
     ORDER BY i.ID_ITEM`, [integer(req.query.offset ?? 0,0,1000000),integer(req.params.id,0,2147483647),
